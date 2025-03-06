@@ -10,7 +10,6 @@ from peft import (
 import math
 from safetensors.torch import load_file
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
 def print_trainable_parameters(model):
     trainable_parameters = 0
@@ -62,12 +61,12 @@ class ICAE(torch.nn.Module):
         self.dim = self.icae.config.hidden_size
         self.icae = get_peft_model(self.icae, lora_config)
         
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.memory_token_embed = nn.Embedding(self.mem_size + 3, self.dim, padding_idx=None)
         self.loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, use_fast=False)
-        self.append_sequence = torch.arange(self.vocab_size, self.vocab_size + self.mem_size, dtype=torch.long, device=device).unsqueeze(0)    # mem tokens
+        self.append_sequence = torch.arange(self.vocab_size, self.vocab_size + self.mem_size, dtype=torch.long, device=self.device).unsqueeze(0)    # mem tokens
         
         if self.training:
             self.init()
@@ -221,3 +220,56 @@ class ICAE(torch.nn.Module):
             torch.cuda.empty_cache()
         
         return compress_outputs
+    
+    def run_inference(self, text: str):
+        self.eval()
+        with torch.no_grad():
+            tokenized_text = self.tokenizer(text, truncation=True,
+                                          max_length=5120, padding=False,
+                                          return_attention_mask=False)
+            # Generate compressed outputs
+            input_ids = torch.LongTensor([tokenized_text['input_ids']]).to(self.device)
+            memory_slots = self._compress(input_ids)
+            prompt_ids = torch.LongTensor([[self.ae_token_id]]).to(self.device)
+
+            prompt_answer_embs = self.tokens_to_embeddings(prompt_ids)
+            memory_slots = memory_slots.to(prompt_answer_embs)
+            decoder_input_embeddings = torch.cat((memory_slots.unsqueeze(0), prompt_answer_embs), dim=1)
+            output = decoder_input_embeddings.clone()
+
+            outputs = []
+            generate_text = []
+            past_key_values = None
+
+            # Generate text output
+            for i in range(512):
+                with self.icae.disable_adapter():   # no independent decoder; use self.icae
+                    out = self.icae(inputs_embeds=output, past_key_values=past_key_values, use_cache=True)
+                logit = out.logits[:, -1, :self.vocab_size-1]
+                past_key_values = out.past_key_values
+
+                next_token_id = torch.argmax(logit, dim=-1)
+                # print(next_token_id)
+                
+                if next_token_id.item() == 2:   # eos
+                    break
+
+                output = self.icae.get_base_model().model.embed_tokens(next_token_id).unsqueeze(1).to(self.device)
+                generate_text.append(next_token_id.item())
+
+            generated_text = self.tokenizer.decode(generate_text)
+            outputs.append(generated_text)
+
+        return output
+
+    def encode_inference(self, text):
+        self.eval()
+        with torch.no_grad():
+            tokenized_text = self.tokenizer(text, truncation=True,
+                                          max_length=5120, padding=False,
+                                          return_attention_mask=False)
+            # Generate compressed outputs
+            input_ids = torch.LongTensor([tokenized_text['input_ids']]).to(self.device)
+            memory_slots = self._compress(input_ids)
+
+        return memory_slots
