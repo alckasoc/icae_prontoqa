@@ -237,7 +237,6 @@ class ICAE(torch.nn.Module):
             decoder_input_embeddings = torch.cat((memory_slots.unsqueeze(0), prompt_answer_embs), dim=1)
             output = decoder_input_embeddings.clone()
 
-            outputs = []
             generate_text = []
             past_key_values = None
 
@@ -258,9 +257,8 @@ class ICAE(torch.nn.Module):
                 generate_text.append(next_token_id.item())
 
             generated_text = self.tokenizer.decode(generate_text)
-            outputs.append(generated_text)
 
-        return output
+        return generated_text
 
     def encode_inference(self, text):
         self.eval()

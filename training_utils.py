@@ -272,35 +272,6 @@ def pretrain_tokenize_function(
     return text_output
 
 
-def instruct_ft_tokenize_function(examples, model, mem):
-    text_output = model.tokenizer(examples["input"], max_length=5120, truncation=True, padding=False, return_attention_mask=False, add_special_tokens=False)
-    prompt_output = model.tokenizer(examples["prompt"], truncation=False, padding=False, return_attention_mask=False, add_special_tokens=False)
-    label_output = model.tokenizer(examples["answer"], truncation=False, padding=False, return_attention_mask=False, add_special_tokens=False)
-    text_output['prompt_answer_ids'] = []
-    text_output['labels'] = []
-
-    max_len = model.training_args.model_max_length  # heuristic
-
-    for idx in range(len(text_output["input_ids"])):
-        
-        length = len(text_output["input_ids"][idx])
-        num_segments = model.compute_num_segments(length)
-        total_mem_length = num_segments * model.mem_size
-        
-        prompt_ids = [mem[0]] * total_mem_length + [model.ft_token_id] + prompt_output['input_ids'][idx]
-        prompt_ids = [1, 733, 16289, 28793] + prompt_ids + [733, 28748, 16289, 28793]   # special formats for prompt in Mistral
-        answer_ids = label_output['input_ids'][idx] + [model.eos_id]
-
-        text_output['prompt_answer_ids'].append(prompt_ids + answer_ids)
-            
-        labels = [-100] * len(prompt_ids) + answer_ids
-        text_output['labels'].append(labels)
-        
-        assert len(text_output['prompt_answer_ids'][-1]) == len(labels)
-        
-    return text_output
-
-
 class DataCollatorForDynamicPadding:
     def __init__(self, pad_token_id, pad_to_multiple_of=None):
         self.pad_token_id = pad_token_id
