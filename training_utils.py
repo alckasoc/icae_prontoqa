@@ -2,7 +2,7 @@ from transformers import Trainer
 import os
 import torch
 import random
-import re
+import gc
 
 from transformers.trainer_utils import get_last_checkpoint
 import math
@@ -77,21 +77,6 @@ def run_inference(model, lines):
 
 
 def train_model(args, notes, model, train_dataset, eval_dataset, model_args, training_args, lines, data_collator=None):
- 
-    last_checkpoint = None
-    if os.path.isdir(training_args.output_dir) and not training_args.overwrite_output_dir:
-        last_checkpoint = get_last_checkpoint(training_args.output_dir)
-        if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
-            raise ValueError(
-                f"Output directory ({training_args.output_dir}) already exists and is not empty. "
-                "Use --overwrite_output_dir to overcome."
-            )
-        elif last_checkpoint is not None and training_args.resume_from_checkpoint is None:
-            print(
-                f"Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, change "
-                "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
-            )
-    
     if max(training_args.per_device_train_batch_size, training_args.per_device_eval_batch_size) == 1:
         data_collator = None
         
@@ -109,6 +94,8 @@ def train_model(args, notes, model, train_dataset, eval_dataset, model_args, tra
         },
         notes=notes
     )
+
+    training_args.output_dir = os.path.join(training_args.output_dir, run.name)
     
     trainer = Trainer(
         model=model,
@@ -120,14 +107,9 @@ def train_model(args, notes, model, train_dataset, eval_dataset, model_args, tra
 
     checkpoint = None
     
-    if training_args.resume_from_checkpoint is not None:
-        checkpoint = training_args.resume_from_checkpoint
-    elif last_checkpoint is not None:
-        checkpoint = last_checkpoint
-
     print(f"Loaded from the checkpoint: {checkpoint}")
 
-    train_result = trainer.train(resume_from_checkpoint=checkpoint)
+    train_result = trainer.train(resume_from_checkpoint=None)
     # trainer.save_model()
     trainer.log_metrics("train", train_result.metrics)
     metrics = trainer.evaluate()
@@ -135,6 +117,21 @@ def train_model(args, notes, model, train_dataset, eval_dataset, model_args, tra
     trainer.save_metrics("eval", metrics)
 
     torch.save(trainer.model.state_dict(), f"{training_args.output_dir}/model_weights.pth")
+
+    #### 🚀 **Free Up GPU Memory BEFORE Re-Loading Model** ####
+    print("🚀 Clearing VRAM before inference...")
+
+    # Move model to CPU first (prevents GPU tensors lingering)
+    model.to("cpu")
+    del model  # Delete model object
+
+    # Delete Trainer & Free Memory
+    del trainer
+    gc.collect()  # Garbage collection
+    torch.cuda.empty_cache()  # Clear VRAM
+
+    #### 🚀 **Now Reload the Model for Inference** ####
+    print("🚀 Re-loading model for inference...")
 
     # EVALUATION
     lora_config = LoraConfig(

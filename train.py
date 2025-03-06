@@ -130,9 +130,6 @@ class TrainingArguments(transformers.TrainingArguments):
     num_train_epochs: int = field(
         default=1
     )
-    eval_steps: int = field(
-        default=0
-    )
 
 def main(model_args, training_args, args, notes):    
     print("Loading dataset...")
@@ -272,7 +269,6 @@ def parse_args():
     parser.add_argument("--optim", type=str, default="adamw_torch", help="Optimizer type.")
     parser.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay coefficient.")
     parser.add_argument("--eval_strategy", type=str, default="epoch", help="Evaluation strategy.")
-    parser.add_argument("--eval_steps", type=int, default=1000, help="Evaluation steps.")
     parser.add_argument("--notes", type=str, help="Additional notes for the run.")
 
     args = parser.parse_args()
