@@ -4,7 +4,6 @@ import torch
 import random
 import gc
 
-from transformers.trainer_utils import get_last_checkpoint
 import math
 import wandb
 from peft import (

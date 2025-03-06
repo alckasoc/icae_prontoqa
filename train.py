@@ -2,7 +2,6 @@ import transformers
 
 from dataclasses import dataclass, field
 from typing import Optional
-from datasets import load_dataset
 from peft import (
     LoraConfig,
 )
@@ -11,11 +10,10 @@ import json
 
 from training_utils import pretrain_tokenize_function, DataCollatorForDynamicPadding, train_model
 from model import ICAE
-from datasets import Dataset, DatasetDict
+from datasets import Dataset
 
 import warnings
 warnings.filterwarnings("ignore")
-import re
 
 def preprocess_function(examples):
     return {
