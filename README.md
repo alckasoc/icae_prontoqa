@@ -39,7 +39,7 @@ I use `wandb` for logging. Make sure login when prompted during training!
 For inference, you can run this following code (to run the model I've trained):
 
 ```
-from training import ModelArguments, TrainingArguments
+from train import ModelArguments, TrainingArguments
 from model import ICAE
 from peft import LoraConfig
 import torch
@@ -64,6 +64,7 @@ model = ICAE(model_args, training_args, lora_config)
 
 path_to_weights = ...  # Fill in.
 model.load_state_dict(torch.load(path_to_weights), strict=False)
+model = model.to("cuda")
 model.eval()
 
 query = "Question: Insects are not eight-legged. Arthropods are invertebrates. Lepidopterans are insects. Each animal is multicellular. Invertebrates are animals. Butterflies are lepidopterans. Every insect is an arthropod. Arthropods are segmented. Each spider is eight-legged. Rex is a butterfly."  # This is an evaluation example.
