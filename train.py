@@ -2,7 +2,7 @@ import transformers
 
 from dataclasses import dataclass, field
 from typing import Optional
-from peft import (
+from peft import ( # type: ignore
     LoraConfig,
 )
 import argparse
@@ -10,24 +10,10 @@ import json
 
 from training_utils import pretrain_tokenize_function, DataCollatorForDynamicPadding, train_model
 from model import ICAE
-from datasets import Dataset
+from datasets import Dataset # type: ignore
 
 import warnings
 warnings.filterwarnings("ignore")
-
-def preprocess_function(examples):
-    return {
-        "cot_only": examples["chain_of_thought"],  # Chain of Thought only
-        "full_format": (
-            f"Question: {examples['question']}\n"
-            f"Query: {examples['query']}\n"
-            f"Chain of Thought: {examples['chain_of_thought']}"
-        ),  # Full format: Question + Query + CoT
-        "q_q_only": (
-            f"Question: {examples['question']}\n"
-            f"Query: {examples['query']}"
-        )  # Only Question + Query
-    }
 
 
 @dataclass
@@ -49,6 +35,10 @@ class ModelArguments:
         default=True,
         metadata={"help": "if true, the model ckpt will be initialized for training; else, it's for inference"}
     )
+    h_noiser_ratio: float = field(
+        default=0.3,
+        metadata={"help": "h_noiser ratio"}
+    )
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
@@ -62,36 +52,16 @@ class TrainingArguments(transformers.TrainingArguments):
         default=1,
         metadata={"help": "Enabling the fixed mem size."},
     )
-    mean_compression_rate: int = field(
-        default=128*4,
-        metadata={"help": "Mean compression rate; default=4"},
-    )
-    min_tokens_for_lm: int = field(
-        default=64,
-        metadata={"help": "Minimum tokens for lm objective learning"},
-    )
-    leave_tokens_for_lm: int = field(
-        default=8,
-        metadata={"help": "Leave some tokens without loss for lm objective"},
-    )
-    lm_ratio: float = field(
-        default=0.0,
-        metadata={"help": "Ratio for LM training."},
-    )
-    add_special_token_for_lm: bool = field(
-        default=False,
-        metadata={"help": "Add a special token for the prompt of language modeling; default: False"},
-    )
     restore_from: str = field(
         default="",
         metadata={"help": "The checkpoint that should be restored from for fine-tuning"}
     )
     per_device_train_batch_size: int = field(
-        default=1,
+        default=4,
         metadata={"help": "The batch size per GPU/XPU/TPU/MPS/NPU core/CPU for training."}
     )
     per_device_eval_batch_size: int = field(
-        default=1,
+        default=4,
         metadata={"help": "The batch size per GPU/XPU/TPU/MPS/NPU core/CPU for evaluation."}
     )
     report_to: str = field(
@@ -136,8 +106,8 @@ def main(model_args, training_args, args, notes):
     with open("345hop_random_true.json") as f:
         data = json.load(f)
     
-    for key, example in data.items():
-        for in_context_key, sample in example.items():
+    for _, example in data.items():
+        for _, sample in example.items():
             processed_data.append({
                 "question": sample["question"],
                 "query": sample["query"],
@@ -150,9 +120,6 @@ def main(model_args, training_args, args, notes):
     train_dataset = split_dataset["train"]
     eval_dataset = split_dataset["test"]
 
-    train_dataset = train_dataset.map(preprocess_function)
-    eval_dataset = eval_dataset.map(preprocess_function)
-    
     train_dataset = train_dataset.shuffle(seed=42)
     eval_dataset = eval_dataset.shuffle(seed=42)
     print("Dataset loaded successfully...")
@@ -164,15 +131,8 @@ def main(model_args, training_args, args, notes):
     with open("eval_10_inference_examples.jsonl", "r") as f:
         eval_10_inference_examples = [json.loads(line) for line in f]
 
-    if args.input_type == "cot_only":
-        train_10_inference_examples = [i['chain_of_thought'] for i in train_10_inference_examples]
-        eval_10_inference_examples = [i['chain_of_thought'] for i in eval_10_inference_examples]
-    elif args.input_type == "full_format":
-        train_10_inference_examples = [f"Question: {i['question']}\nQuery: {i['query']}\nChain of Thought: {i['chain_of_thought']}" for i in train_10_inference_examples]
-        eval_10_inference_examples = [f"Question: {i['question']}\nQuery: {i['query']}\nChain of Thought: {i['chain_of_thought']}" for i in eval_10_inference_examples]
-    elif args.input_type == "q_q_only":
-        train_10_inference_examples = [f"Question: {i['question']}\nQuery: {i['query']}" for i in train_10_inference_examples]
-        eval_10_inference_examples = [f"Question: {i['question']}\nQuery: {i['query']}" for i in eval_10_inference_examples]
+    train_10_inference_examples = [{"input": f"Question: {i['question']} {i['query']}", "reasoning": i['chain_of_thought']} for i in train_10_inference_examples]
+    eval_10_inference_examples = [{"input": f"Question: {i['question']} {i['query']}", "reasoning": i['chain_of_thought']} for i in eval_10_inference_examples]
 
     lines = train_10_inference_examples + eval_10_inference_examples
     
@@ -185,7 +145,7 @@ def main(model_args, training_args, args, notes):
     )
 
     print("Loading model...")
-    model = ICAE(model_args, training_args, lora_config).to("cuda")
+    model = ICAE(model_args, training_args, lora_config).to(args.device)
     print("Model loaded successfully...")
     
     memory_size = training_args.fixed_mem_size
@@ -196,37 +156,29 @@ def main(model_args, training_args, args, notes):
     train_fn_kwargs = {
         "tokenizer": model.tokenizer, 
         "model_max_length": model.training_args.model_max_length,
-        "mem_size": model.mem_size,
-        "min_tokens_for_lm": model.training_args.min_tokens_for_lm,
-        "mean_compression_rate": model.mean_compression_rate,
-        "add_special_token_for_lm": model.training_args.add_special_token_for_lm,
-        "leave_tokens_for_lm": model.training_args.leave_tokens_for_lm,
         "ae_token_id": model.ae_token_id,
         "eos_id": model.eos_id,
-        "lm_token_id": model.lm_token_id,
+        "boc_token_id": model.boc_token_id,
+        "eoc_token_id": model.eoc_token_id,
         "mem": MEM_TOKENS, 
-        "input_type": args.input_type, 
-        "lm_ratio": training_args.lm_ratio
     }
 
     eval_fn_kwargs = {
         "tokenizer": model.tokenizer, 
         "model_max_length": model.training_args.model_max_length,
-        "mem_size": model.mem_size,
-        "min_tokens_for_lm": model.training_args.min_tokens_for_lm,
-        "mean_compression_rate": model.mean_compression_rate,
-        "add_special_token_for_lm": model.training_args.add_special_token_for_lm,
-        "leave_tokens_for_lm": model.training_args.leave_tokens_for_lm,
         "ae_token_id": model.ae_token_id,
         "eos_id": model.eos_id,
-        "lm_token_id": model.lm_token_id,
+        "boc_token_id": model.boc_token_id,
+        "eoc_token_id": model.eoc_token_id,
         "mem": MEM_TOKENS, 
-        "input_type": args.input_type, 
     }
     
-    train_dataset = train_dataset.map(pretrain_tokenize_function, batched=True, batch_size=1, fn_kwargs=train_fn_kwargs)
+    train_dataset = train_dataset.map(pretrain_tokenize_function, batched=True, batch_size=100, fn_kwargs=train_fn_kwargs)
     eval_dataset = eval_dataset.map(pretrain_tokenize_function, batched=True, fn_kwargs=eval_fn_kwargs)
     print("Finished tokenizing train/eval datasets...")
+
+    train_dataset = train_dataset.select([0])
+    eval_dataset = train_dataset
 
     data_collator = DataCollatorForDynamicPadding(model.pad_token_id)
 
@@ -239,7 +191,8 @@ def main(model_args, training_args, args, notes):
         eval_dataset, 
         model_args,
         training_args, 
-        lines,
+        # lines,
+        [{"input": f"Question: {train_dataset[0]['question']} {train_dataset[0]['query']}", "reasoning": train_dataset[0]['chain_of_thought']}],
         data_collator,
     )
     print("Finished training...")
@@ -248,15 +201,17 @@ def parse_args():
     """Parses command-line arguments and initializes Model & Training arguments dynamically."""
     parser = argparse.ArgumentParser(description="Fine-tune a LLaMA model with LoRA.")
 
+    parser.add_argument("--device", type=str, default="cuda", help="Device to use for training.")
+
     # Add arguments dynamically
     parser.add_argument("--model_name_or_path", type=str, required=True, help="Pretrained model path.")
     parser.add_argument("--lora_r", type=int, default=128, help="LoRA rank.")
     parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA scaling factor.")
     parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout rate.")
+    parser.add_argument("--h_noiser_ratio", type=float, default=0.3, help="Ratio of hidden size to noise size.")
 
     # Training Arguments (Automatically Converted to `TrainingArguments`)
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to save checkpoints and logs.")
-    parser.add_argument("--input_type", type=str, required=True, help="Can be 'cot_only', 'full_format', or 'q_q_only'.")
     parser.add_argument("--test_size", type=float, default=0.1, help="Test dataset split ratio.")
     parser.add_argument("--max_steps", type=int, default=5000, help="Maximum training steps.")
     parser.add_argument("--num_train_epochs", type=int, default=10, help="Number of training epochs.")
@@ -274,7 +229,7 @@ def parse_args():
     # Convert JSON string arguments
     args.lr_scheduler_kwargs = json.loads(args.lr_scheduler_kwargs)
 
-    skip_list = ['input_type', 'test_size', 'notes']
+    skip_list = ['test_size', 'notes', 'device']
     
     model_args = ModelArguments(**{k: v for k, v in vars(args).items() if k in ModelArguments.__annotations__})
     training_args = TrainingArguments(**{k: v for k, v in vars(args).items() if k not in ModelArguments.__annotations__ and k not in skip_list})

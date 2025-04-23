@@ -1,77 +1,74 @@
 from transformers import Trainer
 import os
-import torch
+import torch # type: ignore
 import random
 import gc
 
-import math
 import wandb
-from peft import (
+from peft import ( # type: ignore
     LoraConfig,
 )
-from tqdm import tqdm
 from model import ICAE
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def run_inference(model, lines):
+def run_batch_inference(
+    model: ICAE,
+    lines: list[dict],
+    device: torch.device,
+    max_steps: int = 512,
+    use_mean: bool = True
+) -> list[str]:
+    """
+    Batch inference wrapper for ICAE model.
+
+    Args:
+        model: Trained ICAE instance.
+        lines: List of dicts with keys 'input' and 'reasoning'.
+        device: torch device to run on.
+        max_steps: Maximum decoding steps.
+        use_mean: Whether to use deterministic latent (mu) or sample.
+
+    Returns:
+        List of generated strings, one per line.
+    """
     model.eval()
-    outputs = []
-    print("Running inference")
-    with torch.no_grad():
-        for line in tqdm(lines):
-            print("=========================== START ============================")
-            print("Current line: ", line)
-            # Tokenize input text
-            tokenized_text = model.tokenizer(line, truncation=True,
-                                          max_length=5120, padding=False,
-                                          return_attention_mask=False)
-            # Generate compressed outputs
-            input_ids = torch.LongTensor([tokenized_text['input_ids']]).to(device)
-            print("input_ids shape: ", input_ids.size())
-            memory_slots = model._compress(input_ids)
-            print("memory_slots shape: ", memory_slots.size())
-            
-            # prompt_output = model.tokenizer(data['prompt'], add_special_tokens=False, padding=False)
-            prompt_ids = torch.LongTensor([[model.ae_token_id]]).to(device)
-            print("prompt_ids shape: ", prompt_ids.size())
+    model.to(device)
 
-            prompt_answer_embs = model.tokens_to_embeddings(prompt_ids)
-            print("prompt_answer_embs shape: ", prompt_answer_embs.size())
+    # Tokenize and prepare batches
+    inputs, prompts = [], []
+    for line in lines:
+        txt = model.tokenizer(
+            line['input'], truncation=True, max_length=5120,
+            padding=False, return_attention_mask=False
+        )
+        chain = model.tokenizer(
+            line['reasoning'], truncation=True, max_length=5120,
+            padding=False, return_attention_mask=False
+        )
+        enc_ids = (
+            txt['input_ids']
+            + [model.boc_token_id]
+            + chain['input_ids'][1:]  # Remove padding token from beginning because we treat this as the entire sequence.
+            + [model.eoc_token_id]
+        )
+        inputs.append(enc_ids)
+        prompts.append(model.append_sequence[0].tolist() + [model.ae_token_id])
 
-            memory_slots = memory_slots.to(prompt_answer_embs)
-                        
-            # Concatenate and clone input embeddings
-            decoder_input_embeddings = torch.cat((memory_slots.unsqueeze(0), prompt_answer_embs), dim=1)
-            print("decoder_input_embeddings shape: ", decoder_input_embeddings.size())
+    # Pad encoder inputs
+    pad_id = model.pad_token_id
+    max_len = max(len(ids) for ids in inputs)
+    inputs_padded = [ids + [pad_id] * (max_len - len(ids)) for ids in inputs]
 
-            output = decoder_input_embeddings.clone()
-            print("output shape: ", output.size())
+    input_ids_tensor = torch.LongTensor(inputs_padded).to(device)
+    prompt_ids_tensor = torch.LongTensor(prompts).to(device)
 
-            generate_text = []
-            past_key_values = None
-
-            # Generate text output
-            for i in range(512):
-                with model.icae.disable_adapter():   # no independent decoder; use self.icae
-                    out = model.icae(inputs_embeds=output, past_key_values=past_key_values, use_cache=True)
-                logit = out.logits[:, -1, :model.vocab_size-1]
-                past_key_values = out.past_key_values
-
-                next_token_id = torch.argmax(logit, dim=-1)
-                # print(next_token_id)
-                
-                if next_token_id.item() == 2:   # eos
-                    break
-
-                output = model.icae.get_base_model().model.embed_tokens(next_token_id).unsqueeze(1).to(device)
-                generate_text.append(next_token_id.item())
-
-            generated_text = model.tokenizer.decode(generate_text)
-            outputs.append(generated_text)
-
-            print("=========================== END ============================")
-
+    # Invoke model inference
+    outputs = model.inference(
+        input_ids=input_ids_tensor,
+        prompt_ids=prompt_ids_tensor,
+        max_steps=max_steps,
+        use_mean=use_mean
+    )
     return outputs
 
 
@@ -79,6 +76,9 @@ def train_model(args, notes, model, train_dataset, eval_dataset, model_args, tra
     if max(training_args.per_device_train_batch_size, training_args.per_device_eval_batch_size) == 1:
         data_collator = None
         
+    print("LENGTH OF TRAIN DATASET: ", len(train_dataset))
+    print("LENGTH OF EVAL DATASET: ", len(eval_dataset))
+
     # print training_args at local_rank 0
     local_rank = int(os.getenv('LOCAL_RANK', '0'))
     if local_rank == 0:
@@ -143,141 +143,113 @@ def train_model(args, notes, model, train_dataset, eval_dataset, model_args, tra
     model = ICAE(model_args, training_args, lora_config)
     print(f"Loading trained checkpoint from {training_args.output_dir}")
     model.load_state_dict(torch.load(f"{training_args.output_dir}/model_weights.pth"), strict=False)
-    model = model.to(device)
+    model = model.to(args.device)
 
-    outputs = run_inference(model, lines)
+    #### 🚀 **Batch Inference** ####
+    print("🚀 Running batch inference with run_batch_inference…")
+    outputs = run_batch_inference(
+        model=model,
+        lines=lines,
+        device=args.device,
+        max_steps=512,
+        use_mean=True
+    )
 
-    my_outputs = []
-    for i, j in zip(lines, outputs):
-        print("=========================================================================")
-        print(i)
-        print("=========================================================================")
-        print(j)
-        print("=========================================================================")
-        my_outputs.append([i, j])
-        
+    table_data = []
+    for inp, out in zip(lines, outputs):
+        print("========================================")
+        print("INPUT: ", inp)
+        print("OUTPUT:", out)
+        print("========================================")
+        table_data.append([inp, out])
+
     my_table = wandb.Table(
         columns=["input", "output"],
-        data=my_outputs
+        data=table_data
     )
-
-    run.log(
-        {
-            "icae_new": my_table
-        }
-    )
-    
+    run.log({"icae_new": my_table})
     run.finish()
 
-def text_extraction(input_ids, length, lm_ratio=0.0):
+
+def text_extraction(input_ids, length):
     
     input_len = len(input_ids)
     assert input_len >= 1, f"Error: invalid input length ({input_len})"
     
-    # ae
-    if random.random() >= lm_ratio: 
-        if input_len <= length: # if shorter, keep the complete text
-            return input_ids, []
-        else:
-            last_start = input_len - length
-            random_start = random.randint(0, last_start)
-            return input_ids[random_start: random_start+length], []
-    
-    # lm    
-    # What happens when either a or b (in first if case) is very small? If b is very small, it'll be an AE task. If a is small, still lm task.
-    # What happens in the second else case if b is very small? It's treated as an AE task.
-    if input_len <= length:
-        r = random.randint(0, input_len-1)
-        return input_ids[:r+1], input_ids[r+1:]
+    if input_len <= length: # if shorter, keep the complete text
+        return input_ids
     else:
         last_start = input_len - length
         random_start = random.randint(0, last_start)
-        return input_ids[random_start: random_start+length], input_ids[random_start+length:]
-
-def _compute_num_segments(total_length, mem_size, mean_compression_rate):
-    assert total_length > 0
-    num_segments = math.ceil(total_length / (mem_size * mean_compression_rate))  # 128 * 4 -> 1 * (128*4)
-    return num_segments
-
+        return input_ids[random_start: random_start+length]
+    
 def pretrain_tokenize_function(
     examples, 
     tokenizer,
     model_max_length,
-    mem_size,
-    min_tokens_for_lm,
-    mean_compression_rate,
-    add_special_token_for_lm,
-    leave_tokens_for_lm,
     ae_token_id,
     eos_id,
-    lm_token_id,
-    mem, 
-    input_type, 
-    lm_ratio=0.0
+    boc_token_id,
+    eoc_token_id,
+    mem,
 ):
-    mid_point = len(examples[input_type])
-    all_texts = examples[input_type] + examples["chain_of_thought"]
+    # 1) Build all the raw text inputs in one pass
+    texts = [
+        f"Question: {q} {query}"
+        for q, query in zip(examples["question"], examples["query"])
+    ]
+    chains = examples["chain_of_thought"]
 
-    # Batch tokenize together (single call)
-    tokenized_outputs = tokenizer(
-        all_texts, 
-        truncation=False, 
-        padding=False, 
-        return_attention_mask=False
+    # 2) Tokenize both lists in batch
+    tokenized_text = tokenizer(
+        texts,
+        truncation=False,
+        padding=False,
+        return_attention_mask=False,
+    )
+    tokenized_chain = tokenizer(
+        chains,
+        truncation=False,
+        padding=False,
+        return_attention_mask=False,
     )
 
-    # Split back into input & CoT tokenized outputs
-    text_output = {key: val[:mid_point] for key, val in tokenized_outputs.items()}  # First half
-    reasoning_trace_output = {key: val[mid_point:] for key, val in tokenized_outputs.items()}  # Second half
+    # 3) Now build your three outputs in a single comprehension
+    all_input_ids       = []
+    all_prompt_ans_ids  = []
+    all_labels          = []
 
-    text_output['prompt_answer_ids'] = []
-    text_output['labels'] = []
-    
-    max_len = model_max_length  # heuristic
+    for qt_ids, chain_ids in zip(tokenized_text["input_ids"],
+                                 tokenized_chain["input_ids"]):
+        # 3a) trim the question if needed
+        question_ids = text_extraction(qt_ids, model_max_length)
 
-    # Each data point in the batch can be AE or LM.
-    for idx in range(len(text_output["input_ids"])):        
-        ae = True
-        a, b = text_extraction(text_output["input_ids"][idx], max_len, lm_ratio=lm_ratio)
-        length_a = len(a)
-        num_segments = _compute_num_segments(length_a, mem_size, mean_compression_rate)
-        total_mem_length = num_segments * mem_size
+        # 3b) assemble encoder inputs
+        input_ids = question_ids + [boc_token_id] + chain_ids[1:] + [eoc_token_id]
 
-        # Make sure that it is lm task iff it has at least min tokens for lm (64).
-        if len(b) > min_tokens_for_lm:  # avoid too few tokens for lm, which is a waste of computing
-            ae = False
-            b = b[:max_len]
+        # 3c) assemble decoder prompt+answer
+        prompt_ids       = mem + [ae_token_id]
+        answer_ids       = chain_ids[1:] + [eos_id]
+        prompt_ans_ids   = prompt_ids + answer_ids
 
-        text_output['input_ids'][idx] = a
+        # 3d) labels: mask prompt with -100
+        labels = [-100] * len(prompt_ids) + answer_ids
 
-        # decoder part: note that in v2, we add mem_tokens to the prompt_ids for easy implementation; which is different from v1 implementation where mem tokens are not in the prompt_ids
-        if ae:  # autoencoding objective
-            # Why is it mem[0]? Filler memory token, will be overwritten during forward pass.
-            prompt_ids = [mem[0]] * total_mem_length + [ae_token_id]
-            answer_ids = reasoning_trace_output['input_ids'][idx] + [eos_id]    # if ae, eos token
-        else:   # lm objective
-            prompt_ids = [mem[0]] * total_mem_length
-            if add_special_token_for_lm:
-                prompt_ids += [lm_token_id]
-            answer_ids = b   # if lm, no eos token
+        all_input_ids      .append(input_ids)
+        all_prompt_ans_ids .append(prompt_ans_ids)
+        all_labels         .append(labels)
 
-        text_output['prompt_answer_ids'].append(prompt_ids + answer_ids)
-        if ae:
-            labels = [-100] * len(prompt_ids) + answer_ids
-        else:
-            labels = [-100] * len(prompt_ids) + [-100] * leave_tokens_for_lm + answer_ids[leave_tokens_for_lm:] # no loss for leave_tokens_for_lm
-        text_output['labels'].append(labels)
-        assert len(text_output['prompt_answer_ids'][-1]) == len(labels)
-        
-    return text_output
-
+    return {
+        "input_ids":       all_input_ids,
+        "prompt_answer_ids": all_prompt_ans_ids,
+        "labels":          all_labels,
+    }
 
 class DataCollatorForDynamicPadding:
     def __init__(self, pad_token_id, pad_to_multiple_of=None):
         self.pad_token_id = pad_token_id
         self.pad_to_multiple_of = pad_to_multiple_of
     def __call__(self, examples):
-        print("DataCollatorForDynamicPadding examples shape: ", len(examples))
         input_ids = [torch.tensor(example["input_ids"], dtype=torch.long) for example in examples]
         labels = [torch.tensor(example["labels"], dtype=torch.long) for example in examples]
         prompt_answer_ids = [torch.tensor(example["prompt_answer_ids"], dtype=torch.long) for example in examples]

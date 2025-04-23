@@ -1,3 +1,6 @@
 **/.ipynb_checkpoints
 **/__pycache__
 wandb/*
+*.code-workspace
+**/tmp.ipynb
+tmp_*.ipynb
