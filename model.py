@@ -68,10 +68,10 @@ class ICAE(torch.nn.Module):
         ).unsqueeze(0)   # shape: (1, mem_size)
         self.register_buffer("append_sequence", append_seq)
 
-        # self.latent_dim = self.dim   # or set this to some smaller dimension if desired
-        # self.fc_mu = nn.Linear(self.dim, self.latent_dim, dtype=torch.bfloat16)
-        # self.fc_logvar = nn.Linear(self.dim, self.latent_dim, dtype=torch.bfloat16)
-        # self.beta = model_args.h_noiser_ratio
+        self.latent_dim = self.dim   # or set this to some smaller dimension if desired
+        self.fc_mu = nn.Linear(self.dim, self.latent_dim, dtype=torch.bfloat16)
+        self.fc_logvar = nn.Linear(self.dim, self.latent_dim, dtype=torch.bfloat16)
+        self.beta = model_args.h_noiser_ratio
 
     def train(self, mode: bool = True):
         # 1) flip training/eval flags as usual
@@ -124,30 +124,30 @@ class ICAE(torch.nn.Module):
         # collect memory tokens
         mem_flag = (input_ids >= self.vocab_size) & (input_ids < self.vocab_size_with_mem)  # (B, T_enc + mem_size)
         compress_outputs = compress_outputs[mem_flag]    # (B*mem_size, D)
-        # compress_outputs = compress_outputs.view(batch_size, self.mem_size, -1)  # (B, mem_size, D)
+        compress_outputs = compress_outputs.view(batch_size, self.mem_size, -1)  # (B, mem_size, D)
 
-        # pooled = compress_outputs.mean(dim=1)   # (B, D)
+        pooled = compress_outputs.mean(dim=1)   # (B, D)
 
-        # # Compute the latent parameters
-        # mu = self.fc_mu(pooled)       # (B, D)
-        # log_var = self.fc_logvar(pooled)   # (B, D)
+        # Compute the latent parameters
+        mu = self.fc_mu(pooled)       # (B, D)
+        log_var = self.fc_logvar(pooled)   # (B, D)
 
-        # # Reparameterization trick to sample z
-        # std = torch.exp(0.5 * log_var)
-        # eps = torch.randn_like(std)
-        # z = eps.mul(std).add_(mu)   # (B, D)
+        # Reparameterization trick to sample z
+        std = torch.exp(0.5 * log_var)
+        eps = torch.randn_like(std)
+        z = eps.mul(std).add_(mu)   # (B, D)
 
-        # z_mem_flat = (
-        #     z
-        #     .unsqueeze(1)                    # (B, 1, D)
-        #     .expand(-1, self.mem_size, -1)   # (B, mem_size, D)
-        #     .reshape(-1, z.size(-1))         # (B*mem_size, D)
-        # )
+        z_mem_flat = (
+            z
+            .unsqueeze(1)                    # (B, 1, D)
+            .expand(-1, self.mem_size, -1)   # (B, mem_size, D)
+            .reshape(-1, z.size(-1))         # (B*mem_size, D)
+        )
 
         # decoder part
         decoder_mem_flag = (prompt_answer_ids >= self.vocab_size) & (prompt_answer_ids < self.vocab_size_with_mem)  # (B, T_dec)
 
-        prompt_answer_embs[decoder_mem_flag] = compress_outputs # z_mem_flat
+        prompt_answer_embs[decoder_mem_flag] = z_mem_flat
         special_prompt = prompt_answer_ids >= self.vocab_size_with_mem  # (B, T_dec); NOTE: This works because boc/eoc tokens aren't included in prompt_answer_ids (decoder input).
         special_offsets = (prompt_answer_ids - self.vocab_size)[special_prompt]  # (B*T_dec,)
         special_embs_flat = self.memory_token_embed(special_offsets)  # (B*T_dec, D)
@@ -166,8 +166,8 @@ class ICAE(torch.nn.Module):
         target_ids = labels[:,1:].reshape(-1)  # (B*T_dec,)
 
         loss_recon = self.loss_fct(effective_logits, target_ids)
-        # kl_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
-        loss = loss_recon #+ self.beta * kl_loss
+        kl_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
+        loss = loss_recon + self.beta * kl_loss
 
         return {"loss": loss, "logits": logits}
     
@@ -190,9 +190,9 @@ class ICAE(torch.nn.Module):
 
         mem_flag = (input_ids >= self.vocab_size) & (input_ids < self.vocab_size_with_mem)  # (B, T_enc + mem_size)
         flat_mem = last_hidden[mem_flag]  # (B*mem_size, D)
-        # compress_outputs = flat_mem.view(batch_size, self.mem_size, -1)  # (B, mem_size, D)
+        compress_outputs = flat_mem.view(batch_size, self.mem_size, -1)  # (B, mem_size, D)
 
-        return flat_mem
+        return compress_outputs
 
     def get_decoder_input_embeds(
         self,
@@ -200,23 +200,22 @@ class ICAE(torch.nn.Module):
         prompt_ids: torch.LongTensor,
         use_mean: bool = True
     ) -> torch.Tensor:
-        # 1) compress input and get z
-        mem_outputs = self.compress(input_ids)        # (B, mem_size, dim)
-        # pooled = mem_outputs.mean(dim=1)               # (B, dim)
-        # mu = self.fc_mu(pooled)
-        # logvar = self.fc_logvar(pooled)
-        # if use_mean:
-        #     z = mu
-        # else:
-        #     std = (0.5 * logvar).exp()
-        #     z = mu + std * torch.randn_like(std)
+        mem_outputs = self.compress(input_ids)        # (B, mem_size, D)
+        pooled = mem_outputs.mean(dim=1)               # (B, D)
+        mu = self.fc_mu(pooled)
+        logvar = self.fc_logvar(pooled)
+        if use_mean:
+            z = mu
+        else:
+            std = (0.5 * logvar).exp()
+            z = mu + std * torch.randn_like(std)
 
-        # flat_z = z.unsqueeze(1).expand(-1, self.mem_size, -1).reshape(-1, z.size(-1))
+        flat_z = z.unsqueeze(1).expand(-1, self.mem_size, -1).reshape(-1, z.size(-1))
 
         prompt_embs = self.icae.get_base_model().model.embed_tokens(prompt_ids)
 
         dec_mem_flag = (prompt_ids >= self.vocab_size) & (prompt_ids < self.vocab_size_with_mem)
-        prompt_embs[dec_mem_flag] = mem_outputs
+        prompt_embs[dec_mem_flag] = flat_z
 
         special = prompt_ids >= self.vocab_size_with_mem
         offs = (prompt_ids - self.vocab_size)[special]
